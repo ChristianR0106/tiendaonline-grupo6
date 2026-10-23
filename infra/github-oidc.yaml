@@ -1,15 +1,14 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   URPOnline - Conexión segura GitHub Actions -> AWS sin Access Keys (OIDC).
-  Crea el proveedor de identidad de GitHub y un rol IAM que SOLO puede asumir
-  la rama main de tu repositorio. Se despliega UNA vez por cuenta de AWS.
+  Crea el proveedor de identidad de GitHub y un rol IAM para tu repositorio.
 Parameters:
   GitHubOwner:
     Type: String
     Description: Tu usuario u organización de GitHub (el dueño de TU fork)
   RepoName:
     Type: String
-    Default: tiendaonline
+    Default: tiendaonline-grupo6
     Description: Nombre de tu repositorio en GitHub
   CreateOidcProvider:
     Type: String
@@ -41,9 +40,7 @@ Resources:
               StringEquals:
                 'token.actions.githubusercontent.com:aud': sts.amazonaws.com
               StringLike:
-                'token.actions.githubusercontent.com:sub': !Sub 'repo:${GitHubOwner}/${RepoName}:ref:refs/heads/main'
-      # Laboratorio: la pila crea VPC, EC2, RDS, ElastiCache, IAM, S3... por eso AdministratorAccess.
-      # Mejora para producción: reemplazar por una política de mínimo privilegio.
+                'token.actions.githubusercontent.com:sub': !Sub 'repo:${GitHubOwner}/${RepoName}:*'
       ManagedPolicyArns: [!Sub 'arn:${AWS::Partition}:iam::aws:policy/AdministratorAccess']
       MaxSessionDuration: 7200
 Outputs:
