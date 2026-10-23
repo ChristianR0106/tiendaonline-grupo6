@@ -325,7 +325,7 @@ Resources:
             dnf install -y aws-cfn-bootstrap
             # Si algo falla, avisa a CloudFormation para que el despliegue se marque como fallido (y haga rollback).
             trap '/opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource Scaling --region ${AWS::Region}' ERR
-            dnf install -y nginx unzip amazon-cloudwatch-agent aspnetcore-runtime-8.0 pgbouncer jq
+            dnf install -y nginx unzip amazon-cloudwatch-agent aspnetcore-runtime-8.0 podman jq
             mkdir -p /opt/urponline
             aws s3 cp s3://${ArtifactBucket}/${ArtifactKey} /tmp/urp.zip
             unzip -oq /tmp/urp.zip -d /opt/urponline || [ $? -eq 1 ]   # 1 = solo advertencia (ZIP hecho en Windows); el test siguiente valida
@@ -366,17 +366,19 @@ Resources:
             WantedBy=multi-user.target
             SYSTEMD
 
-            # --- CONFIGURACIÓN DE PGBOUNCER ---
+            # --- CONFIGURACIÓN Y EJECUCIÓN DE PGBOUNCER (PODMAN) ---
             SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id ${DbSecret} --query SecretString --output text --region ${AWS::Region})
             DB_USER=$(echo $SECRET_JSON | jq -r .username)
             DB_PASS=$(echo $SECRET_JSON | jq -r .password)
 
-    cat <<EOF > /etc/pgbouncer/pgbouncer.ini
+            mkdir -p /etc/pgbouncer
+
+            cat <<EOF > /etc/pgbouncer/pgbouncer.ini
 [databases]
 urponline = host=${Postgres.Endpoint.Address} port=5432 dbname=urponline
 
 [pgbouncer]
-listen_addr = 127.0.0.1
+listen_addr = 0.0.0.0
 listen_port = 6432
 pool_mode = transaction
 max_client_conn = 400
@@ -391,14 +393,19 @@ EOF
 "$DB_USER" "$DB_PASS"
 EOF
 
-            chown -R pgbouncer:pgbouncer /etc/pgbouncer
             chmod 600 /etc/pgbouncer/userlist.txt
 
-            systemctl enable pgbouncer
-            systemctl restart pgbouncer
+            podman run -d \
+              --name pgbouncer \
+              --net=host \
+              --restart=always \
+              -v /etc/pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro \
+              -v /etc/pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro \
+              edoburu/pgbouncer:latest
+
             systemctl enable urponline
             systemctl restart urponline
-            
+
             cat >/etc/nginx/nginx.conf <<'NGINX'
             user nginx;
             worker_processes auto;
