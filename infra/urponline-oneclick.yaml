@@ -325,7 +325,7 @@ Resources:
             dnf install -y aws-cfn-bootstrap
             # Si algo falla, avisa a CloudFormation para que el despliegue se marque como fallido (y haga rollback).
             trap '/opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource Scaling --region ${AWS::Region}' ERR
-            dnf install -y nginx unzip amazon-cloudwatch-agent aspnetcore-runtime-8.0
+            dnf install -y nginx unzip amazon-cloudwatch-agent aspnetcore-runtime-8.0 pgbouncer jq
             mkdir -p /opt/urponline
             aws s3 cp s3://${ArtifactBucket}/${ArtifactKey} /tmp/urp.zip
             unzip -oq /tmp/urp.zip -d /opt/urponline || [ $? -eq 1 ]   # 1 = solo advertencia (ZIP hecho en Windows); el test siguiente valida
@@ -334,7 +334,7 @@ Resources:
             cat >/etc/urponline.env <<'ENV'
             ASPNETCORE_ENVIRONMENT=Production
             ASPNETCORE_URLS=http://127.0.0.1:8080
-            ConnectionStrings__Postgres=Host=${Postgres.Endpoint.Address};Port=5432;Database=urponline;Username=urponline;SSL Mode=Require;Trust Server Certificate=true
+            ConnectionStrings__Postgres=Host=127.0.0.1;Port=6432;Database=urponline;Username=urponline;SSL Mode=Require;
             # Sin contraseña: la app la pide a Secrets Manager con el AWS SDK.
             Database__SecretArn=${DbSecret}
             ConnectionStrings__Redis=${Redis.PrimaryEndPoint.Address}:6379,ssl=true,abortConnect=false
@@ -365,6 +365,40 @@ Resources:
             [Install]
             WantedBy=multi-user.target
             SYSTEMD
+
+            # --- CONFIGURACIÓN DE PGBOUNCER ---
+            SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id ${DbSecret} --query SecretString --output text --region ${AWS::Region})
+            DB_USER=$(echo $SECRET_JSON | jq -r .username)
+            DB_PASS=$(echo $SECRET_JSON | jq -r .password)
+
+    cat <<EOF > /etc/pgbouncer/pgbouncer.ini
+[databases]
+urponline = host=${Postgres.Endpoint.Address} port=5432 dbname=urponline
+
+[pgbouncer]
+listen_addr = 127.0.0.1
+listen_port = 6432
+pool_mode = transaction
+max_client_conn = 400
+default_pool_size = 30
+reserve_pool_size = 5
+auth_type = plain
+auth_file = /etc/pgbouncer/userlist.txt
+server_tls_sslmode = require
+EOF
+
+            cat <<EOF > /etc/pgbouncer/userlist.txt
+"$DB_USER" "$DB_PASS"
+EOF
+
+            chown -R pgbouncer:pgbouncer /etc/pgbouncer
+            chmod 600 /etc/pgbouncer/userlist.txt
+
+            systemctl enable pgbouncer
+            systemctl restart pgbouncer
+            systemctl enable urponline
+            systemctl restart urponline
+            
             cat >/etc/nginx/nginx.conf <<'NGINX'
             user nginx;
             worker_processes auto;

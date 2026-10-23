@@ -9,14 +9,14 @@
 <title>URPOnline | Tienda en línea</title><link rel="stylesheet" href="~/css/site.css" asp-append-version="true" /></head>
 <body>
 <header class="topbar" id="top">
- <a class="brand" asp-controller="Home" asp-action="Index">URP<span>Online</span><i></i></a>
+ <a class="brand" asp-controller="Home" asp-action="Index">URP<span>Cyber Monday</span><i></i></a>
  <form class="search" method="get" asp-controller="Home" asp-action="Index" role="search">
   <select name="category" aria-label="Categoría">
    <option value="">Todos</option>
    @foreach(var cat in categories){ if(cat==currentCategory){<option selected value="@cat">@cat</option>}else{<option value="@cat">@cat</option>} }
   </select>
   <div class="search-box">
-   <input id="search-input" name="q" value="@currentQuery" placeholder="Buscar en URPOnline" aria-label="Buscar" autocomplete="off" role="combobox" aria-expanded="false" aria-controls="search-suggestions" aria-autocomplete="list"/>
+   <input id="search-input" name="q" value="@currentQuery" placeholder="Buscar en URPOnline V2" aria-label="Buscar" autocomplete="off" role="combobox" aria-expanded="false" aria-controls="search-suggestions" aria-autocomplete="list"/>
    <ul id="search-suggestions" class="suggestions" role="listbox" hidden></ul>
   </div>
   <button type="submit" aria-label="Buscar">🔍</button>
@@ -29,7 +29,7 @@
 </nav>
 <main class="main">@if(TempData["Message"] != null) { <div class="notice">@TempData["Message"]</div> } @RenderBody()</main>
 <footer>
- <a class="back-top" href="#top">Volver arriba</a>
+ <a class="back-top" href="#top">Retroceder</a>
  <div class="footer-body"><span class="brand small">URP<span>Online</span></span><p>E-commerce de laboratorio · AWS VPC/DMZ · ASP.NET Core MVC</p><p class="served-by">Servido por: <b>@Environment.MachineName</b></p></div>
 </footer>
 <script src="~/js/search.js" asp-append-version="true"></script>
