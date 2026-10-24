@@ -329,7 +329,7 @@ Resources:
             dnf install -y aws-cfn-bootstrap
             # Si algo falla, avisa a CloudFormation para que el despliegue se marque como fallido (y haga rollback).
             trap '/opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource Scaling --region ${AWS::Region}' ERR
-            dnf install -y nginx unzip amazon-cloudwatch-agent aspnetcore-runtime-8.0 podman jq
+            dnf install -y nginx unzip amazon-cloudwatch-agent aspnetcore-runtime-8.0 docker jq
             mkdir -p /opt/urponline
             aws s3 cp s3://${ArtifactBucket}/${ArtifactKey} /tmp/urp.zip
             unzip -oq /tmp/urp.zip -d /opt/urponline || [ $? -eq 1 ]   # 1 = solo advertencia (ZIP hecho en Windows); el test siguiente valida
@@ -372,7 +372,7 @@ Resources:
             WantedBy=multi-user.target
             SYSTEMD
 
-            # --- PGBOUNCER: contenedor con podman, solo accesible en 127.0.0.1:6432 ---
+            # --- PGBOUNCER: contenedor con docker, solo accesible en 127.0.0.1:6432 ---
             set +x   # que la contraseña no quede en el log de cloud-init
             SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id ${DbSecret} --query SecretString --output text --region ${AWS::Region})
             DB_USER=$(echo "$SECRET_JSON" | jq -r .username)
@@ -394,16 +394,19 @@ Resources:
             chmod 600 /etc/pgbouncer/pgbouncer.env
             unset SECRET_JSON DB_PASS
             set -x
-            podman pull docker.io/edoburu/pgbouncer:latest
+            systemctl enable --now docker
+            docker pull docker.io/edoburu/pgbouncer:latest
             cat >/etc/systemd/system/pgbouncer.service <<'PGBSVC'
             [Unit]
-            Description=PgBouncer (podman)
+            Description=PgBouncer (docker)
+            Requires=docker.service
+            After=docker.service
             After=network-online.target
             Wants=network-online.target
             [Service]
-            ExecStartPre=-/usr/bin/podman rm -f pgbouncer
-            ExecStart=/usr/bin/podman run --rm --name pgbouncer --env-file /etc/pgbouncer/pgbouncer.env -p 127.0.0.1:6432:5432 docker.io/edoburu/pgbouncer:latest
-            ExecStop=/usr/bin/podman stop pgbouncer
+            ExecStartPre=-/usr/bin/docker rm -f pgbouncer
+            ExecStart=/usr/bin/docker run --rm --name pgbouncer --env-file /etc/pgbouncer/pgbouncer.env -p 127.0.0.1:6432:5432 docker.io/edoburu/pgbouncer:latest
+            ExecStop=/usr/bin/docker stop pgbouncer
             Restart=always
             RestartSec=5
             [Install]
