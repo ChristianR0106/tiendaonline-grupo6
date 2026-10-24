@@ -16,3 +16,18 @@ public class CartController(CartService cart,ShopDbContext db,BusinessEvents eve
  [HttpPost,ValidateAntiForgeryToken]
  public IActionResult Remove(int id) { cart.Remove(HttpContext.Session,id); return RedirectToAction("Index"); }
 }
+[HttpPost]
+public async Task<IActionResult> AddToCart(Guid productId, int quantity = 1)
+{
+    // 1. Agregar producto a la sesión/base de datos
+    await _cartService.AddItemAsync(productId, quantity);
+
+    // 2. Obtener SessionId de la cookie HTTP
+    string sessionId = HttpContext.Session.Id;
+
+    // 3. Invocar métricas SDK
+    await _businessMetrics.TrackCartItemAddedAsync(quantity);
+    await _businessMetrics.RegisterCartActivityAsync(sessionId);
+
+    return RedirectToAction("Index");
+}

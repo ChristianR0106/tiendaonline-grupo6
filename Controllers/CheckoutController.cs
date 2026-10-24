@@ -1,53 +1,110 @@
-using Microsoft.AspNetCore.Mvc;
-using Microsoft.EntityFrameworkCore;
-using System.Data;
-using TiendaOnline.Data;
-using TiendaOnline.Models;
-using TiendaOnline.Services;
-namespace TiendaOnline.Controllers;
-public class CheckoutController(ShopDbContext db,CartService cart,BusinessEvents events,BusinessMetrics metrics):Controller {
- [HttpGet] public async Task<IActionResult> Index() {
-  var vm=await cart.ViewAsync(HttpContext.Session);
-  if(vm.Lines.Count==0) return RedirectToAction("Index","Cart");
-  ViewBag.Cart=vm; return View(new CheckoutInput());
- }
- [HttpPost,ValidateAntiForgeryToken]
- public async Task<IActionResult> Index(CheckoutInput input) {
-  var vm=await cart.ViewAsync(HttpContext.Session);
-  if(vm.Lines.Count==0) return RedirectToAction("Index","Cart");
-  if(!ModelState.IsValid) { ViewBag.Cart=vm; return View(input); }
-  await using var tx=await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted);
-  try {
-   // La actualización condicional impide vender más unidades que el stock disponible.
-   foreach(var line in vm.Lines) {
-    int count=await db.Products.Where(p=>p.Id==line.Product.Id && p.Stock>=line.Quantity)
-      .ExecuteUpdateAsync(updates=>updates.SetProperty(p=>p.Stock,p=>p.Stock-line.Quantity));
-    if(count!=1) {
-     await tx.RollbackAsync();
-     ModelState.AddModelError("","No hay stock suficiente de: "+line.Product.Name);
-     ViewBag.Cart=await cart.ViewAsync(HttpContext.Session); return View(input);
+using MercadoPago.Client.Preference;
+using MercadoPago.Client.Payment;
+using MercadoPago.Config;
+using MercadoPago.Resource.Preference;
+using Amazon.SecretsManager;
+using Amazon.SecretsManager.Model;
+
+namespace URPOnline.Controllers
+{
+    public class CheckoutController : Controller
+    {
+        private readonly IAmazonSecretsManager _secretsManager;
+        private readonly IOrderService _orderService;
+        private readonly BusinessMetrics _businessMetrics;
+
+        public CheckoutController(IAmazonSecretsManager secretsManager, IOrderService orderService, BusinessMetrics businessMetrics)
+        {
+            _secretsManager = secretsManager;
+            _orderService = orderService;
+            _businessMetrics = businessMetrics;
+        }
+
+        // Leer AccessToken desde AWS Secrets Manager
+        private async Task<string> GetMercadoPagoTokenAsync()
+        {
+            var response = await _secretsManager.GetSecretValueAsync(new GetSecretValueRequest
+            {
+                SecretId = "URPOnline/MercadoPagoAccessToken"
+            });
+            return response.SecretString;
+        }
+
+        // 3d. Guardar Pedido y Redirigir a Mercado Pago
+        [HttpPost]
+        public async Task<IActionResult> ProcessCheckout(OrderRequest model)
+        {
+            // 1. Guardar en estado PENDIENTE_PAGO
+            var order = await _orderService.CreateOrderAsync(model, OrderStatus.PENDIENTE_PAGO);
+
+            // 2. Configurar Token de Mercado Pago desde AWS SDK
+            MercadoPagoConfig.AccessToken = await GetMercadoPagoTokenAsync();
+
+            // 3. Crear Preferencia de Pago
+            var client = new PreferenceClient();
+            var preference = await client.CreateAsync(new PreferenceRequest
+            {
+                Items = order.Items.Select(i => new PreferenceItemRequest
+                {
+                    Title = i.ProductName,
+                    Quantity = i.Quantity,
+                    UnitPrice = i.UnitPrice,
+                    CurrencyId = "PEN"
+                }).ToList(),
+                ExternalReference = order.Id.ToString(),
+                BackUrls = new PreferenceBackUrlsRequest
+                {
+                    Success = $"{Request.Scheme}://{Request.Host}/Checkout/Confirmation",
+                    Failure = $"{Request.Scheme}://{Request.Host}/Checkout/Confirmation",
+                    Pending = $"{Request.Scheme}://{Request.Host}/Checkout/Confirmation"
+                },
+                AutoReturn = "approved"
+            });
+
+            // 4. Redirigir al cliente al checkout de Mercado Pago
+            return Redirect(preference.InitPoint);
+        }
+
+        // 3e. Confirmación Servidor-Servidor al Volver
+        [HttpGet]
+        public async Task<IActionResult> Confirmation([FromQuery] string payment_id, [FromQuery] string external_reference)
+        {
+            if (string.IsNullOrEmpty(payment_id) || string.IsNullOrEmpty(external_reference))
+                return RedirectToAction("Index", "Home");
+
+            Guid orderId = Guid.Parse(external_reference);
+            var order = await _orderService.GetOrderByIdAsync(orderId);
+
+            // Protección contra duplicados (Idempotencia): Si ya fue procesado, no repetir
+            if (order.Status == OrderStatus.PAGADO)
+            {
+                return View("Success", order);
+            }
+
+            // Validar Estado Real del Pago en los Servidores de Mercado Pago
+            MercadoPagoConfig.AccessToken = await GetMercadoPagoTokenAsync();
+            var paymentClient = new PaymentClient();
+            var payment = await paymentClient.GetAsync(long.Parse(payment_id));
+
+            if (payment.Status == "approved")
+            {
+                order.Status = OrderStatus.PAGADO;
+                order.PaymentId = payment_id;
+                await _orderService.UpdateOrderAsync(order);
+
+                // Métrica de venta confirmada
+                await _businessMetrics.TrackOrderCreatedAsync(order.TotalAmount);
+
+                return View("Success", order);
+            }
+            else
+            {
+                order.Status = OrderStatus.PENDIENTE_PAGO;
+                await _orderService.UpdateOrderAsync(order);
+
+                ViewBag.ErrorMessage = $"El pago fue rechazado o no se completó. Estado: {payment.StatusDetail}";
+                return View("Rejected", order);
+            }
+        }
     }
-   }
-   // Se vuelven a leer los precios de la base de datos, no desde el navegador.
-   var ids=vm.Lines.Select(x=>x.Product.Id).ToArray();
-   var products=await db.Products.AsNoTracking().Where(p=>ids.Contains(p.Id)).ToDictionaryAsync(p=>p.Id);
-   var order=new Order { CustomerName=input.CustomerName,Email=input.Email,Address=input.Address,
-    Items=vm.Lines.Select(l=>new OrderItem{ ProductId=l.Product.Id,ProductName=products[l.Product.Id].Name,
-     Quantity=l.Quantity,UnitPrice=products[l.Product.Id].Price }).ToList() };
-   order.Total=order.Items.Sum(x=>x.Quantity*x.UnitPrice);
-   // Apply the largest active promotion consistently to new orders.
-   var now=DateTime.UtcNow;
-   var promo=await db.Promotions.AsNoTracking().Where(x=>x.Enabled && x.StartsUtc<=now && x.EndsUtc>now)
-      .OrderByDescending(x=>x.DiscountPercent).FirstOrDefaultAsync();
-   if(promo!=null) order.Total=Math.Round(order.Total*(100m-promo.DiscountPercent)/100m,2);
-   db.Orders.Add(order); await db.SaveChangesAsync(); await tx.CommitAsync();
-   cart.Clear(HttpContext.Session);
-   await events.RecordAsync("order_created",orderId:order.Id,amount:order.Total);
-   await metrics.OrderCreatedAsync(order.Total,HttpContext.RequestAborted);
-   return RedirectToAction("Success",new{id=order.Id});
-  } catch {
-   await tx.RollbackAsync(); throw;
-  }
- }
- [HttpGet] public IActionResult Success(int id) { ViewBag.OrderId=id; return View(); }
 }

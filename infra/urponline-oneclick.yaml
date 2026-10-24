@@ -46,6 +46,25 @@ Parameters:
 Conditions:
   MultiAZ: !Equals [!Ref EnableMultiAZ,'true']
 Resources:
+MercadoPagoSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: URPOnline/MercadoPagoAccessToken
+      Description: "Token de acceso de prueba para Mercado Pago"
+
+  EC2IAMRolePolicies:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: ReadMercadoPagoSecretPolicy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+            Resource: !Ref MercadoPagoSecret
+      Roles:
+        - !Ref EC2Role
   VPC:
     Type: AWS::EC2::VPC
     Properties: {CidrBlock: 10.0.0.0/16,EnableDnsHostnames: true,EnableDnsSupport: true,Tags: [{Key: Name,Value: URPOnline-VPC}]}
@@ -220,19 +239,64 @@ Resources:
       AssumeRolePolicyDocument: {Version: '2012-10-17',Statement: [{Effect: Allow,Principal: {Service: ec2.amazonaws.com},Action: 'sts:AssumeRole'}]}
       ManagedPolicyArns: ['arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore', 'arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy']
       Policies:
-        - PolicyName: URPOnlineS3Read
+        - PolicyName: AppSecretsPolicy
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action: ['s3:GetObject','s3:ListBucket']
-                Resource: [!GetAtt SupplierBucket.Arn, !Sub '${SupplierBucket.Arn}/*']
-              - Effect: Allow
-                Action: ['s3:GetObject']
-                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/${ArtifactKey}'
-              - Effect: Allow
-                Action: ['secretsmanager:GetSecretValue']
+                Action:
+                  - secretsmanager:GetSecretValue
                 Resource: !Ref DbSecret
+  AbandonedCartAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: URPOnline-AbandonedCartAlarm
+      AlarmDescription: "Dispara cuando hay carritos activos pero ninguna compra en 15 minutos"
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Metrics:
+        - Id: e1
+          Expression: "IF(m1 > 0 AND m2 == 0, 1, 0)"
+          Label: "Estado Carritos Abandonados"
+        - Id: m1
+          MetricStat:
+            Metric:
+              Namespace: URPOnline
+              MetricName: ActiveCarts
+            Period: 900
+            Stat: Maximum
+        - Id: m2
+          MetricStat:
+            Metric:
+              Namespace: URPOnline
+              MetricName: OrdersCreated
+            Period: 900
+            Stat: Sum
+
+  # Widget de Conversión en el Dashboard
+  URPOnlineDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: URPOnline-Dashboard
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  [ "URPOnline", "ActiveCarts", { "stat": "Maximum", "period": 60, "color": "#1f77b4" } ],
+                  [ "URPOnline", "OrdersCreated", { "stat": "Sum", "period": 60, "color": "#2ca02c" } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "title": "Conversión: Carritos Activos vs Ventas Realizadas",
+                "period": 300
+              }
+            }
+          ]
+        }
   # VPC Flow Logs: registra el tráfico aceptado y rechazado de toda la VPC en CloudWatch Logs.
   FlowLogGroup:
     Type: AWS::Logs::LogGroup
@@ -366,19 +430,17 @@ Resources:
             WantedBy=multi-user.target
             SYSTEMD
 
-            # --- CONFIGURACIÓN Y EJECUCIÓN DE PGBOUNCER (PODMAN) ---
+            # --- CONFIGURACIÓN DE PGBOUNCER EN USERDATA ---
             SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id ${DbSecret} --query SecretString --output text --region ${AWS::Region})
             DB_USER=$(echo $SECRET_JSON | jq -r .username)
             DB_PASS=$(echo $SECRET_JSON | jq -r .password)
-
-            mkdir -p /etc/pgbouncer
 
             cat <<EOF > /etc/pgbouncer/pgbouncer.ini
 [databases]
 urponline = host=${Postgres.Endpoint.Address} port=5432 dbname=urponline
 
 [pgbouncer]
-listen_addr = 0.0.0.0
+listen_addr = 127.0.0.1
 listen_port = 6432
 pool_mode = transaction
 max_client_conn = 400
@@ -386,7 +448,8 @@ default_pool_size = 30
 reserve_pool_size = 5
 auth_type = plain
 auth_file = /etc/pgbouncer/userlist.txt
-server_tls_sslmode = require
+logfile = /var/log/pgbouncer/pgbouncer.log
+pidfile = /var/run/pgbouncer/pgbouncer.pid
 EOF
 
             cat <<EOF > /etc/pgbouncer/userlist.txt
@@ -394,41 +457,9 @@ EOF
 EOF
 
             chmod 600 /etc/pgbouncer/userlist.txt
+            chown -R pgbouncer:pgbouncer /etc/pgbouncer
 
-            podman run -d \
-              --name pgbouncer \
-              --net=host \
-              --restart=always \
-              -v /etc/pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro \
-              -v /etc/pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro \
-              edoburu/pgbouncer:latest
-
-            systemctl enable urponline
-            systemctl restart urponline
-
-            cat >/etc/nginx/nginx.conf <<'NGINX'
-            user nginx;
-            worker_processes auto;
-            error_log /var/log/nginx/error.log warn;
-            pid /run/nginx.pid;
-            events { worker_connections 1024; }
-            http {
-             include /etc/nginx/mime.types;
-             default_type application/octet-stream;
-             access_log /var/log/nginx/access.log;
-             server {
-              listen 80 default_server;
-              server_name _;
-              location / {
-                proxy_pass http://127.0.0.1:8080;
-                proxy_http_version 1.1;
-                proxy_set_header Host $host;
-                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
-                proxy_set_header X-Forwarded-Host $host;
-              }
-             }
-            }
+            systemctl restart pgbouncer
             NGINX
             rm -f /etc/nginx/conf.d/default.conf
             systemctl daemon-reload

@@ -1,7 +1,15 @@
-<div class="panel success">
- <div class="success-icon">✓</div>
- <h1>Pedido registrado, ¡gracias!</h1>
- <p>Tu pedido <b>#@ViewBag.OrderId</b> quedó registrado en PostgreSQL con estado <b>PENDIENTE_PAGO</b>.</p>
- <p class="hint">Esta aplicación es un laboratorio educativo: no procesa pagos reales.</p>
- <a class="btn-cart inline" asp-controller="Home" asp-action="Index">Seguir comprando</a>
+@model URPOnline.Models.Order
+
+<div class="container text-center my-5">
+    @if (Model.Status == URPOnline.Models.OrderStatus.PAGADO)
+    {
+        <h1 class="text-success">¡Gracias por tu compra!</h1>
+        <p>Tu pedido <strong>#@Model.Id</strong> ha sido procesado correctamente.</p>
+        <p>ID de Pago Mercado Pago: <code>@Model.PaymentId</code></p>
+    }
+    else
+    {
+        <h1 class="text-warning">Pago Pendiente</h1>
+        <p>Tu pedido <strong>#@Model.Id</strong> está en espera de confirmación.</p>
+    }
 </div>

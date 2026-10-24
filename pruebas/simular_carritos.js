@@ -7,11 +7,13 @@ export const options = {
 };
 
 export default function () {
-  // Simular sesión única por VU
-  const res = http.get('http://<ALB-DNS-NAME>/Cart');
-  
-  // Agregar producto al carrito
-  http.post('http://<ALB-DNS-NAME>/Cart/AddToCart', {
+  // Reemplaza con tu URL real
+  const baseUrl = 'http://ec2-100-52-153-159.compute-1.amazonaws.com';
+  // 1. Entrar a la tienda
+  http.get(`${baseUrl}/Cart`);
+
+  // 2. Agregar al carrito
+  http.post(`${baseUrl}/Cart/AddToCart`, {
     productId: '00000000-0000-0000-0000-000000000001',
     quantity: '1',
   });
