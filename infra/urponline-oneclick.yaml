@@ -344,7 +344,7 @@ Resources:
             cat >/etc/urponline.env <<'ENV'
             ASPNETCORE_ENVIRONMENT=Production
             ASPNETCORE_URLS=http://127.0.0.1:8080
-            ConnectionStrings__Postgres=Host=127.0.0.1;Port=6432;Database=urponline;Username=urponline;SSL Mode=Disable;
+            ConnectionStrings__Postgres=Host=127.0.0.1;Port=5432;Database=urponline;Username=urponline;SSL Mode=Disable;
             # Sin contraseña: la app la pide a Secrets Manager con el AWS SDK.
             Database__SecretArn=${DbSecret}
             # Bloque 3c: ARN del secreto con el token de prueba de Mercado Pago (la app lo lee con el AWS SDK).
@@ -378,7 +378,7 @@ Resources:
             WantedBy=multi-user.target
             SYSTEMD
 
-            # --- PGBOUNCER: contenedor con docker, solo accesible en 127.0.0.1:6432 ---
+            # --- PGBOUNCER: contenedor con docker, solo accesible en 127.0.0.1:5432 ---
             set +x   # que la contraseña no quede en el log de cloud-init
             SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id ${DbSecret} --query SecretString --output text --region ${AWS::Region})
             DB_USER=$(echo "$SECRET_JSON" | jq -r .username)
@@ -411,7 +411,7 @@ Resources:
             Wants=network-online.target
             [Service]
             ExecStartPre=-/usr/bin/docker rm -f pgbouncer
-            ExecStart=/usr/bin/docker run --rm --name pgbouncer --env-file /etc/pgbouncer/pgbouncer.env -p 127.0.0.1:6432:5432 docker.io/edoburu/pgbouncer:latest
+            ExecStart=/usr/bin/docker run --rm --name pgbouncer --env-file /etc/pgbouncer/pgbouncer.env -p 127.0.0.1:5432:5432 docker.io/edoburu/pgbouncer:latest
             ExecStop=/usr/bin/docker stop pgbouncer
             Restart=always
             RestartSec=5
