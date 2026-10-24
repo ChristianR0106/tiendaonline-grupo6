@@ -55,7 +55,7 @@ builder.Services.AddSession(o => {
 
 builder.Services.AddScoped<CartService>();
 builder.Services.AddScoped<BusinessEvents>();
-builder.Services.AddScoped<BusinessMetrics>();
+builder.Services.AddHostedService<ActiveCartsPublisher>();
 
 // Búsqueda semántica: modelo local ONNX + pgvector en PostgreSQL.
 builder.Services.AddSingleton<EmbeddingService>();

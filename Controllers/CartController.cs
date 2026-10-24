@@ -1,14 +1,8 @@
 using System;
-using System.Collections.Generic;
-using System.Security.Cryptography;
-using System.Text;
+using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
-using Amazon;
-using Amazon.CloudWatch;
-using Amazon.CloudWatch.Model;
-using StackExchange.Redis;
 using TiendaOnline.Data;
 using TiendaOnline.Models;
 using TiendaOnline.Services;
@@ -18,27 +12,22 @@ namespace TiendaOnline.Controllers
     [Route("Cart")]
     public class CartController : Controller
     {
-        private static readonly AmazonCloudWatchClient _cwClient = new AmazonCloudWatchClient(RegionEndpoint.USEast2);
         private readonly CartService _cartService;
-        private readonly IConnectionMultiplexer _redis;
+        private readonly BusinessMetrics _metrics;
 
-        public CartController(CartService cartService, IConnectionMultiplexer redis)
+        public CartController(CartService cartService, BusinessMetrics metrics)
         {
             _cartService = cartService;
-            _redis = redis;
+            _metrics = metrics;
         }
 
         // Muestra la vista del carrito en /Cart o /Cart/Index
-        // La vista Views/Cart/Index.cshtml debe empezar con:
-        // @model TiendaOnline.Models.CartViewModel
+        // Views/Cart/Index.cshtml usa @model CartViewModel
         [HttpGet("")]
         [HttpGet("Index")]
         public async Task<IActionResult> Index()
         {
             var cartModel = await _cartService.ViewAsync(HttpContext.Session);
-
-            // No se redirige si está vacío (causaría un bucle infinito).
-            // La vista se encarga de mostrar "Tu carrito está vacío".
             return View(cartModel);
         }
 
@@ -52,59 +41,23 @@ namespace TiendaOnline.Controllers
 
             if (targetId > 0)
             {
-                _cartService.Add(HttpContext.Session, targetId, quantity <= 0 ? 1 : quantity);
+                // Misma regla que CartService.Add (1 a 99), para que la métrica coincida con lo agregado
+                int qty = Math.Clamp(quantity, 1, 99);
+                _cartService.Add(HttpContext.Session, targetId, qty);
 
-                // --- LÓGICA DE ACTIVIDAD EN REDIS (ActiveCarts - Hash SHA256) ---
+                // Métricas: nunca deben romper la compra
                 try
                 {
-                    // Hash SHA-256 del SessionId (nunca guardar el SessionId tal cual)
-                    string sessionHash = GetSessionHash(HttpContext.Session.Id);
-                    var db = _redis.GetDatabase();
+                    // CartItemsAdded: cada "Agregar al carrito"
+                    await _metrics.TrackCartItemAddedAsync(qty);
 
-                    // Anota la sesión en Redis con TTL de 5 minutos
-                    await db.StringSetAsync($"active_cart:{sessionHash}", DateTime.UtcNow.ToString("o"), TimeSpan.FromMinutes(5));
+                    // ActiveCarts: anota la sesión (hasheada con SHA-256 dentro de BusinessMetrics)
+                    await _metrics.RegisterCartActivityAsync(HttpContext.Session.Id);
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"Error al registrar actividad de carrito en Redis: {ex.Message}");
+                    Console.WriteLine($"Error registrando métricas del carrito: {ex.Message}");
                 }
-            }
-
-            try
-            {
-                var metricRequest = new PutMetricDataRequest
-                {
-                    Namespace = "URPOnline",
-                    MetricData = new List<MetricDatum>
-                    {
-                        new MetricDatum
-                        {
-                            MetricName = "ActiveCarts",
-                            Value = 1,
-                            Unit = StandardUnit.Count,
-                            Dimensions = new List<Dimension>
-                            {
-                                new Dimension { Name = "Environment", Value = "Development" }
-                            }
-                        },
-                        new MetricDatum
-                        {
-                            MetricName = "CartItemsAdded",
-                            Value = quantity > 0 ? quantity : 1,
-                            Unit = StandardUnit.Count,
-                            Dimensions = new List<Dimension>
-                            {
-                                new Dimension { Name = "Environment", Value = "Development" }
-                            }
-                        }
-                    }
-                };
-
-                await _cwClient.PutMetricDataAsync(metricRequest);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error registrando métricas: {ex.Message}");
             }
 
             // Si es petición AJAX responde JSON
@@ -124,14 +77,6 @@ namespace TiendaOnline.Controllers
             _cartService.Remove(HttpContext.Session, id);
             return RedirectToAction("Index");
         }
-
-        // Método privado helper para hashear el ID de sesión
-        private static string GetSessionHash(string sessionId)
-        {
-            using var sha256 = SHA256.Create();
-            byte[] bytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(sessionId ?? Guid.NewGuid().ToString()));
-            return Convert.ToHexString(bytes).ToLowerInvariant();
-        }
     }
 
     [Route("Checkout")]
@@ -140,17 +85,18 @@ namespace TiendaOnline.Controllers
         private readonly CartService _cartService;
         private readonly ShopDbContext _db;
         private readonly BusinessEvents _events;
+        private readonly BusinessMetrics _metrics;
 
-        public CheckoutController(CartService cartService, ShopDbContext db, BusinessEvents events)
+        public CheckoutController(CartService cartService, ShopDbContext db, BusinessEvents events, BusinessMetrics metrics)
         {
             _cartService = cartService;
             _db = db;
             _events = events;
+            _metrics = metrics;
         }
 
         // Muestra el formulario de checkout en /Checkout
-        // La vista Views/Checkout/Index.cshtml usa @model CheckoutInput
-        // y lee el carrito desde ViewBag.Cart
+        // Views/Checkout/Index.cshtml usa @model CheckoutInput y lee el carrito de ViewBag.Cart
         [HttpGet("")]
         [HttpGet("Index")]
         public async Task<IActionResult> Index()
@@ -180,14 +126,13 @@ namespace TiendaOnline.Controllers
                 return RedirectToAction("Index", "Cart");
             }
 
-            // Si falla la validación, vuelve a mostrar el formulario con los errores
             if (!ModelState.IsValid)
             {
                 ViewBag.Cart = cartModel;
                 return View(input);
             }
 
-            var order = new TiendaOnline.Models.Order
+            var order = new Order
             {
                 CustomerName = input.CustomerName,
                 Email = input.Email,
@@ -207,19 +152,20 @@ namespace TiendaOnline.Controllers
             _db.Orders.Add(order);
             await _db.SaveChangesAsync();
 
-            // Registro de evento de negocio (si falla, no se cancela el pedido)
+            // Métrica OrdersCreated y evento de negocio (si fallan, no se cancela el pedido)
             try
             {
+                await _metrics.TrackOrderCreatedAsync(order.Total);
                 await _events.RecordAsync("order_created", orderId: order.Id, amount: order.Total);
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error registrando evento order_created: {ex.Message}");
+                Console.WriteLine($"Error registrando métricas/evento del pedido: {ex.Message}");
             }
 
-            // Vacía el carrito
             _cartService.Clear(HttpContext.Session);
 
+            // TODO (3d): aquí se pedirá el link de pago a Mercado Pago y se redirigirá al cliente
             return RedirectToAction("Success", new { id = order.Id });
         }
 
@@ -237,7 +183,7 @@ namespace TiendaOnline.Controllers
             {
                 Id = order.Id,
                 Status = order.Status,
-                PaymentId = null // Aún no hay integración real con Mercado Pago
+                PaymentId = null
             });
         }
     }
