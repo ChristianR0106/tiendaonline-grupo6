@@ -9,32 +9,40 @@ export const options = {
 export default function () {
   const baseUrl = 'http://ec2-100-52-153-159.compute-1.amazonaws.com';
 
-  // 1. Obtener la portada para extraer la cookie de sesión y el token Anti-forgery
+  // 1. Obtener la página principal
   const homeRes = http.get(`${baseUrl}/`);
   
   check(homeRes, {
     'home status 200': (r) => r.status === 200,
   });
 
-  // Extraer el token anti-forgery del formulario HTML
+  // Extraer el token anti-forgery del HTML (si existe)
   let token = '';
   const match = homeRes.body.match(/name="__RequestVerificationToken"\s+type="hidden"\s+value="([^"]+)"/);
   if (match) {
     token = match[1];
   }
 
-  // 2. Enviar el POST exacto que espera CartController.cs (Acción: Add, Campo: id)
+  // 2. Preparar el cuerpo de la petición POST
   const payload = {
-    id: '1', // ID entero del producto existente (ejemplo: 1)
-    quantity: '1',
+    id: 1,
+    quantity: 1,
     __RequestVerificationToken: token
   };
 
-  const headers = {
-    'Content-Type': 'application/x-www-form-urlencoded',
+  const params = {
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    redirects: 0, // Para capturar el 302 Redirect de ASP.NET Core
   };
 
-  const cartRes = http.post(`${baseUrl}/Cart/Add`, payload, { headers });
+  const cartRes = http.post(`${baseUrl}/Cart/Add`, payload, params);
+
+  // Imprimir el status en la primera iteración si falla
+  if (cartRes.status !== 200 && cartRes.status !== 302 && __ITER === 0) {
+    console.log(`[ERROR] Status: ${cartRes.status} | Body: ${cartRes.body.substring(0, 150)}`);
+  }
 
   check(cartRes, {
     'cart status 200 or 302': (r) => r.status === 200 || r.status === 302,
