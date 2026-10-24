@@ -7,27 +7,42 @@ using Amazon.CloudWatch;
 using TiendaOnline.Data;
 using TiendaOnline.Services;
 using Npgsql;
+using StackExchange.Redis;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddControllersWithViews();
 builder.Services.AddHttpContextAccessor();
+builder.Services.AddScoped<BusinessMetrics>();
 
-// 1. Cadena de conexión principal (apunta a PgBouncer en el puerto 6432)
-var db = builder.Configuration.GetConnectionString("Postgres") ?? throw new InvalidOperationException("Configure ConnectionStrings:Postgres; apunte a PgBouncer 6432 en AWS.");
+// 1. Cadena de conexión principal
+var db = builder.Configuration.GetConnectionString("Postgres") ?? throw new InvalidOperationException("Configure ConnectionStrings:Postgres");
 db = DatabaseSecret.BuildConnectionString(builder.Configuration, db);
 
-// Registrar ShopDbContext para la aplicación usando PgBouncer (puerto 6432)
+// Registrar ShopDbContext para la aplicación
 builder.Services.AddDbContext<ShopDbContext>(o => o.UseNpgsql(db));
 
-var redis = builder.Configuration.GetConnectionString("Redis");
-if (!string.IsNullOrWhiteSpace(redis)) builder.Services.AddStackExchangeRedisCache(o => o.Configuration = redis);
-else if (builder.Environment.IsDevelopment()) builder.Services.AddDistributedMemoryCache();
-else throw new InvalidOperationException("Redis es obligatorio fuera de Development para compartir sesiones entre EC2.");
+// Configuración de Redis y conexión reutilizable IConnectionMultiplexer
+var redisConnectionString = builder.Configuration.GetConnectionString("Redis");
 
-// Claves que cifran la cookie de sesión en Redis (ElastiCache)
-var dataProtection = builder.Services.AddDataProtection().SetApplicationName("URPOnline");
-if (!string.IsNullOrWhiteSpace(redis))
-    dataProtection.PersistKeysToStackExchangeRedis(StackExchange.Redis.ConnectionMultiplexer.Connect(redis), "URPOnline-DataProtection-Keys");
+if (!string.IsNullOrWhiteSpace(redisConnectionString))
+{
+    var multiplexer = ConnectionMultiplexer.Connect(redisConnectionString);
+    builder.Services.AddSingleton<IConnectionMultiplexer>(multiplexer);
+
+    builder.Services.AddStackExchangeRedisCache(o => o.Configuration = redisConnectionString);
+
+    builder.Services.AddDataProtection()
+        .SetApplicationName("URPOnline")
+        .PersistKeysToStackExchangeRedis(multiplexer, "URPOnline-DataProtection-Keys");
+}
+else if (builder.Environment.IsDevelopment())
+{
+    builder.Services.AddDistributedMemoryCache();
+}
+else
+{
+    throw new InvalidOperationException("Redis es obligatorio fuera de Development para compartir sesiones entre EC2.");
+}
 
 builder.Services.AddSession(o => {
     o.Cookie.Name = ".URPOnline.Session";
@@ -72,28 +87,28 @@ app.UseSession();
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
 app.MapControllerRoute("default", "{controller=Home}/{action=Index}/{id?}");
 
-// 2. MIGRACIONES DIRECTAS A RDS (PUERTO 5432)
+// 2. MIGRACIONES (Respeta el puerto 5434 en Development, o 5432 en AWS RDS)
 if (app.Configuration.GetValue<bool>("InitializeDatabase"))
 {
-    // Construir la cadena directa cambiando el puerto de 6432 a 5432
-    var directConnectionStringBuilder = new NpgsqlConnectionStringBuilder(db)
+    var directConnectionStringBuilder = new NpgsqlConnectionStringBuilder(db);
+    
+    // Solo forzar puerto 5432 si NO estamos en entorno Development
+    if (!app.Environment.IsDevelopment())
     {
-        Port = 5432 // Forzar puerto directo a RDS
-    };
+        directConnectionStringBuilder.Port = 5432;
+    }
+
     string directDbConnectionString = directConnectionStringBuilder.ConnectionString;
 
-    // Crear DbContextOptions apuntando a la conexión directa de RDS
     var migrationOptions = new DbContextOptionsBuilder<ShopDbContext>()
         .UseNpgsql(directDbConnectionString)
         .Options;
 
-    // Crear un contexto independiente exclusivo para las migraciones
     using var migrationContext = new ShopDbContext(migrationOptions);
 
     await migrationContext.Database.OpenConnectionAsync();
     try 
     {
-        // Advisory Lock requiere una conexión directa persistente
         await migrationContext.Database.ExecuteSqlRawAsync("SELECT pg_advisory_lock(727001)");
         await migrationContext.Database.MigrateAsync();
         await SeedData.LoadAsync(migrationContext);

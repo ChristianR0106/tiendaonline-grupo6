@@ -8,3 +8,9 @@ public class CheckoutInput {
  [Required, EmailAddress] public string Email { get; set; } = "";
  [Required(ErrorMessage="Ingrese dirección de entrega")] public string Address { get; set; } = "";
 }
+public class OrderResult
+{
+    public int Id { get; set; }
+    public string Status { get; set; } = "PENDIENTE_PAGO";
+    public string? PaymentId { get; set; }
+}

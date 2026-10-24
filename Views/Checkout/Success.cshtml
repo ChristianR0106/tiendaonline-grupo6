@@ -1,7 +1,7 @@
-@model URPOnline.Models.Order
+@model dynamic
 
 <div class="container text-center my-5">
-    @if (Model.Status == URPOnline.Models.OrderStatus.PAGADO)
+    @if (Model.Status == "PAGADO")
     {
         <h1 class="text-success">¡Gracias por tu compra!</h1>
         <p>Tu pedido <strong>#@Model.Id</strong> ha sido procesado correctamente.</p>
