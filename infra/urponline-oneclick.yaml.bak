@@ -1,0 +1,565 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: URPOnline - Despliegue base ALB ASG RDS Redis S3. Artefacto .NET publicado previamente en S3.
+Parameters:
+  ArtifactBucket:
+    Type: String
+    Description: Bucket EXISTENTE con el ZIP publicado (no ZIP de fuentes), en esta región
+  ArtifactKey:
+    Type: String
+    Default: releases/urponline-publish.zip
+    Description: Clave de ZIP con TiendaOnline.dll en la raiz
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 12
+    Description: Use a secret; never hardcode password in this file
+  KeyPair:
+    Type: String
+    Default: ''
+    Description: Optional; recommended SSM Session Manager instead of SSH
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues: [t3.small,t3.medium,t3.large]
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+  AppDesired:
+    Type: Number
+    Default: 2
+  AppMax:
+    Type: Number
+    Default: 4
+  DBBackupRetentionDays:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 35
+    Description: Días de respaldo automático de RDS (cuentas del plan gratuito de AWS admiten como máximo 1; con 0 se desactiva)
+  EnableMultiAZ:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true','false']
+Conditions:
+  MultiAZ: !Equals [!Ref EnableMultiAZ,'true']
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties: {CidrBlock: 10.0.0.0/16,EnableDnsHostnames: true,EnableDnsSupport: true,Tags: [{Key: Name,Value: URPOnline-VPC}]}
+  IGW: {Type: AWS::EC2::InternetGateway}
+  AttachIGW:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref VPC,InternetGatewayId: !Ref IGW}
+  PublicA:
+    Type: AWS::EC2::Subnet
+    Properties: {VpcId: !Ref VPC,CidrBlock: 10.0.1.0/24,AvailabilityZone: !Select [0,!GetAZs ''],MapPublicIpOnLaunch: true}
+  PublicB:
+    Type: AWS::EC2::Subnet
+    Properties: {VpcId: !Ref VPC,CidrBlock: 10.0.2.0/24,AvailabilityZone: !Select [1,!GetAZs ''],MapPublicIpOnLaunch: true}
+  AppA:
+    Type: AWS::EC2::Subnet
+    Properties: {VpcId: !Ref VPC,CidrBlock: 10.0.11.0/24,AvailabilityZone: !Select [0,!GetAZs '']}
+  AppB:
+    Type: AWS::EC2::Subnet
+    Properties: {VpcId: !Ref VPC,CidrBlock: 10.0.12.0/24,AvailabilityZone: !Select [1,!GetAZs '']}
+  DataA:
+    Type: AWS::EC2::Subnet
+    Properties: {VpcId: !Ref VPC,CidrBlock: 10.0.21.0/24,AvailabilityZone: !Select [0,!GetAZs '']}
+  DataB:
+    Type: AWS::EC2::Subnet
+    Properties: {VpcId: !Ref VPC,CidrBlock: 10.0.22.0/24,AvailabilityZone: !Select [1,!GetAZs '']}
+  PublicRT:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref VPC}
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachIGW
+    Properties: {RouteTableId: !Ref PublicRT,DestinationCidrBlock: 0.0.0.0/0,GatewayId: !Ref IGW}
+  PublicAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicA,RouteTableId: !Ref PublicRT}
+  PublicAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicB,RouteTableId: !Ref PublicRT}
+  EipA: {Type: AWS::EC2::EIP,Properties: {Domain: vpc}}
+  EipB: {Type: AWS::EC2::EIP,Properties: {Domain: vpc}}
+  NatA:
+    Type: AWS::EC2::NatGateway
+    DependsOn: AttachIGW
+    Properties: {AllocationId: !GetAtt EipA.AllocationId,SubnetId: !Ref PublicA}
+  NatB:
+    Type: AWS::EC2::NatGateway
+    DependsOn: AttachIGW
+    Properties: {AllocationId: !GetAtt EipB.AllocationId,SubnetId: !Ref PublicB}
+  AppRTA: {Type: AWS::EC2::RouteTable,Properties: {VpcId: !Ref VPC}}
+  AppRTB: {Type: AWS::EC2::RouteTable,Properties: {VpcId: !Ref VPC}}
+  AppRouteA:
+    Type: AWS::EC2::Route
+    Properties: {RouteTableId: !Ref AppRTA,DestinationCidrBlock: 0.0.0.0/0,NatGatewayId: !Ref NatA}
+  AppRouteB:
+    Type: AWS::EC2::Route
+    Properties: {RouteTableId: !Ref AppRTB,DestinationCidrBlock: 0.0.0.0/0,NatGatewayId: !Ref NatB}
+  AssocAppA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref AppA,RouteTableId: !Ref AppRTA}
+  AssocAppB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref AppB,RouteTableId: !Ref AppRTB}
+  DataRT: {Type: AWS::EC2::RouteTable,Properties: {VpcId: !Ref VPC}}
+  # VPC endpoint de S3 (tipo Gateway, gratis): las EC2 privadas llegan a S3 (ZIP, CSV de proveedores,
+  # repositorios de Amazon Linux) por la red interna de AWS, sin pasar por el NAT ni por Internet.
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref AppRTA, !Ref AppRTB]
+  # NACL de la subred de datos: segunda barrera (además de los security groups).
+  # Solo entra PostgreSQL (5432) y Redis (6379) desde las subredes de aplicación; todo lo demás se rechaza.
+  DataNacl:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref VPC
+      Tags: [{Key: Name, Value: URPOnline-datos}]
+  DataNaclInPgA:    {Type: AWS::EC2::NetworkAclEntry, Properties: {NetworkAclId: !Ref DataNacl, RuleNumber: 100, Protocol: 6, RuleAction: allow, Egress: false, CidrBlock: 10.0.11.0/24, PortRange: {From: 5432, To: 5432}}}
+  DataNaclInPgB:    {Type: AWS::EC2::NetworkAclEntry, Properties: {NetworkAclId: !Ref DataNacl, RuleNumber: 101, Protocol: 6, RuleAction: allow, Egress: false, CidrBlock: 10.0.12.0/24, PortRange: {From: 5432, To: 5432}}}
+  DataNaclInRedisA: {Type: AWS::EC2::NetworkAclEntry, Properties: {NetworkAclId: !Ref DataNacl, RuleNumber: 110, Protocol: 6, RuleAction: allow, Egress: false, CidrBlock: 10.0.11.0/24, PortRange: {From: 6379, To: 6379}}}
+  DataNaclInRedisB: {Type: AWS::EC2::NetworkAclEntry, Properties: {NetworkAclId: !Ref DataNacl, RuleNumber: 111, Protocol: 6, RuleAction: allow, Egress: false, CidrBlock: 10.0.12.0/24, PortRange: {From: 6379, To: 6379}}}
+  DataNaclInDatosA: {Type: AWS::EC2::NetworkAclEntry, Properties: {NetworkAclId: !Ref DataNacl, RuleNumber: 120, Protocol: -1, RuleAction: allow, Egress: false, CidrBlock: 10.0.21.0/24}}
+  DataNaclInDatosB: {Type: AWS::EC2::NetworkAclEntry, Properties: {NetworkAclId: !Ref DataNacl, RuleNumber: 121, Protocol: -1, RuleAction: allow, Egress: false, CidrBlock: 10.0.22.0/24}}
+  DataNaclOutAppA:  {Type: AWS::EC2::NetworkAclEntry, Properties: {NetworkAclId: !Ref DataNacl, RuleNumber: 100, Protocol: 6, RuleAction: allow, Egress: true, CidrBlock: 10.0.11.0/24, PortRange: {From: 1024, To: 65535}}}
+  DataNaclOutAppB:  {Type: AWS::EC2::NetworkAclEntry, Properties: {NetworkAclId: !Ref DataNacl, RuleNumber: 101, Protocol: 6, RuleAction: allow, Egress: true, CidrBlock: 10.0.12.0/24, PortRange: {From: 1024, To: 65535}}}
+  DataNaclOutDatosA: {Type: AWS::EC2::NetworkAclEntry, Properties: {NetworkAclId: !Ref DataNacl, RuleNumber: 120, Protocol: -1, RuleAction: allow, Egress: true, CidrBlock: 10.0.21.0/24}}
+  DataNaclOutDatosB: {Type: AWS::EC2::NetworkAclEntry, Properties: {NetworkAclId: !Ref DataNacl, RuleNumber: 121, Protocol: -1, RuleAction: allow, Egress: true, CidrBlock: 10.0.22.0/24}}
+  DataNaclAssocA: {Type: AWS::EC2::SubnetNetworkAclAssociation, Properties: {SubnetId: !Ref DataA, NetworkAclId: !Ref DataNacl}}
+  DataNaclAssocB: {Type: AWS::EC2::SubnetNetworkAclAssociation, Properties: {SubnetId: !Ref DataB, NetworkAclId: !Ref DataNacl}}
+  DataAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref DataA,RouteTableId: !Ref DataRT}
+  DataAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref DataB,RouteTableId: !Ref DataRT}
+  AlbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: URPOnline ALB public HTTP - add ACM HTTPS for production
+      VpcId: !Ref VPC
+      SecurityGroupIngress: [{IpProtocol: tcp,FromPort: 80,ToPort: 80,CidrIp: 0.0.0.0/0}]
+  AppSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: URPOnline apps from ALB only
+      VpcId: !Ref VPC
+      SecurityGroupIngress: [{IpProtocol: tcp,FromPort: 80,ToPort: 80,SourceSecurityGroupId: !Ref AlbSG}]
+  DbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: PostgreSQL from App for initial lab - switch to PgBouncer SG in advanced topology
+      VpcId: !Ref VPC
+      SecurityGroupIngress: [{IpProtocol: tcp,FromPort: 5432,ToPort: 5432,SourceSecurityGroupId: !Ref AppSG}]
+  RedisSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Redis from application
+      VpcId: !Ref VPC
+      SecurityGroupIngress: [{IpProtocol: tcp,FromPort: 6379,ToPort: 6379,SourceSecurityGroupId: !Ref AppSG}]
+  DBSubnet:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties: {DBSubnetGroupDescription: URPOnline data,SubnetIds: [!Ref DataA,!Ref DataB]}
+  Postgres:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Properties:
+      Engine: postgres
+      EngineVersion: '16'   # PostgreSQL 16 en RDS incluye la extensión pgvector
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: 20
+      DBName: urponline
+      MasterUsername: urponline
+      MasterUserPassword: !Ref DBPassword
+      DBSubnetGroupName: !Ref DBSubnet
+      VPCSecurityGroups: [!Ref DbSG]
+      PubliclyAccessible: false
+      BackupRetentionPeriod: !Ref DBBackupRetentionDays
+      MultiAZ: !If [MultiAZ,true,false]
+      StorageEncrypted: true
+  # AWS Secrets Manager: guarda usuario y contraseña de RDS. La app lo lee al arrancar con el AWS SDK
+  # (GetSecretValue); la contraseña ya no se escribe en /etc/urponline.env de la EC2.
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/rds-postgres'
+      Description: Credenciales de RDS PostgreSQL de URPOnline (las lee la app con el AWS SDK)
+      SecretString: !Sub '{"username":"urponline","password":"${DBPassword}"}'
+  # Bloque 3c: secreto del Access Token de PRUEBA de Mercado Pago.
+  # Se crea VACIO (sin SecretString): el valor se carga a mano con
+  #   aws secretsmanager put-secret-value --secret-id <nombre> --secret-string "<token>"
+  # y nunca aparece en GitHub, en este YAML ni en la EC2. La app lo lee con el AWS SDK.
+  MercadoPagoSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/mercadopago-access-token'
+      Description: Access Token de PRUEBA de Mercado Pago (valor cargado a mano, no esta en el YAML)
+  RedisSubnet:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties: {Description: URPOnline data subnets,SubnetIds: [!Ref DataA,!Ref DataB]}
+  Redis:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupDescription: URPOnline Redis session store
+      Engine: redis
+      CacheNodeType: cache.t3.micro
+      NumCacheClusters: 2
+      AutomaticFailoverEnabled: true
+      MultiAZEnabled: true
+      CacheSubnetGroupName: !Ref RedisSubnet
+      SecurityGroupIds: [!Ref RedisSG]
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
+  SupplierBucket:
+    Type: AWS::S3::Bucket
+    Properties: {PublicAccessBlockConfiguration: {BlockPublicAcls: true,BlockPublicPolicy: true,IgnorePublicAcls: true,RestrictPublicBuckets: true},VersioningConfiguration: {Status: Enabled}}
+  AppRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Version: '2012-10-17',Statement: [{Effect: Allow,Principal: {Service: ec2.amazonaws.com},Action: 'sts:AssumeRole'}]}
+      ManagedPolicyArns: ['arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore', 'arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy']
+      Policies:
+        - PolicyName: AppSecretsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: [!Ref DbSecret, !Ref MercadoPagoSecret]
+  # VPC Flow Logs: registra el tráfico aceptado y rechazado de toda la VPC en CloudWatch Logs.
+  FlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub '/urponline/${AWS::StackName}/vpc-flow-logs', RetentionInDays: 3}
+  FlowLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: vpc-flow-logs.amazonaws.com}, Action: 'sts:AssumeRole'}]}
+      Policies:
+        - PolicyName: EscribirFlowLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['logs:CreateLogStream', 'logs:PutLogEvents', 'logs:DescribeLogGroups', 'logs:DescribeLogStreams']
+                Resource: !GetAtt FlowLogGroup.Arn
+  VpcFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceId: !Ref VPC
+      ResourceType: VPC
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref FlowLogGroup
+      DeliverLogsPermissionArn: !GetAtt FlowLogRole.Arn
+      MaxAggregationInterval: 60
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub '/urponline/${AWS::StackName}/app', RetentionInDays: 7}
+  NginxLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub '/urponline/${AWS::StackName}/nginx-access', RetentionInDays: 7}
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: {Roles: [!Ref AppRole]}
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties: {Type: application,Scheme: internet-facing,Subnets: [!Ref PublicA,!Ref PublicB],SecurityGroups: [!Ref AlbSG]}
+  TG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties: {VpcId: !Ref VPC,Port: 80,Protocol: HTTP,TargetType: instance,HealthCheckPath: /health}
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties: {LoadBalancerArn: !Ref ALB,Port: 80,Protocol: HTTP,DefaultActions: [{Type: forward,TargetGroupArn: !Ref TG}]}
+  # HTTPS sin dominio propio: CloudFront entrega https://xxxx.cloudfront.net con el certificado de AWS
+  # y reenvía al ALB por HTTP. (Con dominio propio: certificado ACM + listener 443 en el ALB + Route 53.)
+  CDN:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: URPOnline - HTTPS delante del ALB
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: alb
+            DomainName: !GetAtt ALB.DNSName
+            CustomOriginConfig: {OriginProtocolPolicy: http-only, HTTPPort: 80}
+        DefaultCacheBehavior:
+          TargetOriginId: alb
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad        # Managed-CachingDisabled (carrito y precios siempre al día)
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3 # Managed-AllViewer (cookies, query string y encabezados)
+        CacheBehaviors:
+          - PathPattern: /css/*
+            TargetOriginId: alb
+            ViewerProtocolPolicy: redirect-to-https
+            Compress: true
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6      # Managed-CachingOptimized
+          - PathPattern: /js/*
+            TargetOriginId: alb
+            ViewerProtocolPolicy: redirect-to-https
+            Compress: true
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+  Launch:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: {Arn: !GetAtt InstanceProfile.Arn}
+        SecurityGroupIds: [!Ref AppSG]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euxo pipefail
+            dnf install -y aws-cfn-bootstrap
+            # Si algo falla, avisa a CloudFormation para que el despliegue se marque como fallido (y haga rollback).
+            trap '/opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource Scaling --region ${AWS::Region}' ERR
+            dnf install -y nginx unzip amazon-cloudwatch-agent aspnetcore-runtime-8.0 podman jq
+            mkdir -p /opt/urponline
+            aws s3 cp s3://${ArtifactBucket}/${ArtifactKey} /tmp/urp.zip
+            unzip -oq /tmp/urp.zip -d /opt/urponline || [ $? -eq 1 ]   # 1 = solo advertencia (ZIP hecho en Windows); el test siguiente valida
+            test -f /opt/urponline/TiendaOnline.dll
+            chown -R nginx:nginx /opt/urponline
+            cat >/etc/urponline.env <<'ENV'
+            ASPNETCORE_ENVIRONMENT=Production
+            ASPNETCORE_URLS=http://127.0.0.1:8080
+            ConnectionStrings__Postgres=Host=127.0.0.1;Port=6432;Database=urponline;Username=urponline;SSL Mode=Disable;
+            # Sin contraseña: la app la pide a Secrets Manager con el AWS SDK.
+            Database__SecretArn=${DbSecret}
+            # Bloque 3c: ARN del secreto con el token de prueba de Mercado Pago (la app lo lee con el AWS SDK).
+            MercadoPago__SecretArn=${MercadoPagoSecret}
+            ConnectionStrings__Redis=${Redis.PrimaryEndPoint.Address}:6379,ssl=true,abortConnect=false
+            # Aplica las migraciones EF Core (tablas + pgvector + índice HNSW) al arrancar; un bloqueo en PostgreSQL evita que 2 EC2 migren a la vez.
+            InitializeDatabase=true
+            # La app publica sus métricas de negocio (pedidos, ventas) en CloudWatch con el AWS SDK.
+            Metrics__CloudWatchEnabled=true
+            AWS__Region=${AWS::Region}
+            ENV
+            chmod 600 /etc/urponline.env
+            mkdir -p /var/log/urponline && chown nginx:nginx /var/log/urponline
+            cat >/etc/systemd/system/urponline.service <<'SYSTEMD'
+            [Unit]
+            Description=URPOnline ASP.NET Core
+            After=network-online.target
+            Wants=network-online.target
+            [Service]
+            WorkingDirectory=/opt/urponline
+            EnvironmentFile=/etc/urponline.env
+            ExecStart=/usr/bin/dotnet /opt/urponline/TiendaOnline.dll
+            Restart=always
+            StandardOutput=append:/var/log/urponline/app.log
+            StandardError=append:/var/log/urponline/app.log
+            RestartSec=5
+            User=nginx
+            Group=nginx
+            NoNewPrivileges=true
+            [Install]
+            WantedBy=multi-user.target
+            SYSTEMD
+
+            # --- PGBOUNCER: contenedor con podman, solo accesible en 127.0.0.1:6432 ---
+            set +x   # que la contraseña no quede en el log de cloud-init
+            SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id ${DbSecret} --query SecretString --output text --region ${AWS::Region})
+            DB_USER=$(echo "$SECRET_JSON" | jq -r .username)
+            DB_PASS=$(echo "$SECRET_JSON" | jq -r .password)
+            mkdir -p /etc/pgbouncer
+            cat >/etc/pgbouncer/pgbouncer.env <<EOF
+            DB_HOST=${Postgres.Endpoint.Address}
+            DB_PORT=5432
+            DB_NAME=urponline
+            DB_USER=$DB_USER
+            DB_PASSWORD=$DB_PASS
+            POOL_MODE=transaction
+            MAX_CLIENT_CONN=400
+            DEFAULT_POOL_SIZE=30
+            RESERVE_POOL_SIZE=5
+            AUTH_TYPE=plain
+            SERVER_TLS_SSLMODE=require
+            EOF
+            chmod 600 /etc/pgbouncer/pgbouncer.env
+            unset SECRET_JSON DB_PASS
+            set -x
+            podman pull docker.io/edoburu/pgbouncer:latest
+            cat >/etc/systemd/system/pgbouncer.service <<'PGBSVC'
+            [Unit]
+            Description=PgBouncer (podman)
+            After=network-online.target
+            Wants=network-online.target
+            [Service]
+            ExecStartPre=-/usr/bin/podman rm -f pgbouncer
+            ExecStart=/usr/bin/podman run --rm --name pgbouncer --env-file /etc/pgbouncer/pgbouncer.env -p 127.0.0.1:6432:5432 docker.io/edoburu/pgbouncer:latest
+            ExecStop=/usr/bin/podman stop pgbouncer
+            Restart=always
+            RestartSec=5
+            [Install]
+            WantedBy=multi-user.target
+            PGBSVC
+            systemctl daemon-reload
+            systemctl enable --now pgbouncer
+
+            # --- NGINX: proxy inverso hacia la tienda (127.0.0.1:8080) ---
+            cat >/etc/nginx/conf.d/urponline.conf <<'NGINX'
+            server {
+                listen 80 default_server;
+                server_name _;
+                location / {
+                    proxy_pass http://127.0.0.1:8080;
+                    proxy_http_version 1.1;
+                    proxy_set_header Host $host;
+                    proxy_set_header X-Real-IP $remote_addr;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+                }
+            }
+            NGINX
+            rm -f /etc/nginx/conf.d/default.conf
+            systemctl daemon-reload
+            systemctl enable --now urponline
+            systemctl enable --now nginx
+            # Agente de CloudWatch: logs de la tienda y de Nginx (un log stream por EC2) + memoria y disco.
+            cat >/opt/aws/amazon-cloudwatch-agent/etc/urponline.json <<'CWA'
+            {"logs":{"logs_collected":{"files":{"collect_list":[
+              {"file_path":"/var/log/urponline/app.log","log_group_name":"${AppLogGroup}","log_stream_name":"{instance_id}"},
+              {"file_path":"/var/log/nginx/access.log","log_group_name":"${NginxLogGroup}","log_stream_name":"{instance_id}"}]}}},
+             "metrics":{"namespace":"URPOnline/EC2","append_dimensions":{"AutoScalingGroupName":"${!aws:AutoScalingGroupName}"},
+              "aggregation_dimensions":[["AutoScalingGroupName"]],
+              "metrics_collected":{"mem":{"measurement":["mem_used_percent"]},"disk":{"measurement":["used_percent"],"resources":["/"]}}}}
+            CWA
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/urponline.json
+            curl --retry 20 --retry-delay 3 --retry-connrefused --fail http://127.0.0.1:8080/health
+            # La tienda responde: avisa a CloudFormation que esta EC2 está lista.
+            /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource Scaling --region ${AWS::Region}
+  Scaling:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    # La pila espera a que cada EC2 confirme que la tienda arrancó (cfn-signal).
+    CreationPolicy:
+      ResourceSignal: {Count: !Ref AppDesired, Timeout: PT25M}
+    # Cada versión nueva (ArtifactKey distinto) reemplaza las EC2 de una en una: la tienda no se cae.
+    UpdatePolicy:
+      AutoScalingRollingUpdate: {MinInstancesInService: 1, MaxBatchSize: 1, PauseTime: PT25M, WaitOnResourceSignals: true}
+    Properties:
+      VPCZoneIdentifier: [!Ref AppA,!Ref AppB]
+      MinSize: '2'
+      MaxSize: !Ref AppMax
+      DesiredCapacity: !Ref AppDesired
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      TargetGroupARNs: [!Ref TG]
+      LaunchTemplate: {LaunchTemplateId: !Ref Launch,Version: !GetAtt Launch.LatestVersionNumber}
+  # Alarmas: se ponen en rojo si una EC2 deja de responder al ALB o si la tienda devuelve errores 5xx.
+  UnhealthyHostsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-EC2-no-saludables'
+      AlarmDescription: Hay EC2 detrás del ALB que no responden /health
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - {Name: LoadBalancer, Value: !GetAtt ALB.LoadBalancerFullName}
+        - {Name: TargetGroup, Value: !GetAtt TG.TargetGroupFullName}
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+  Errors5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-errores-5xx'
+      AlarmDescription: La tienda devolvió más de 5 errores 5xx en 5 minutos
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - {Name: LoadBalancer, Value: !GetAtt ALB.LoadBalancerFullName}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+  # Bloque 3b: alarma de carritos abandonados = hay carritos activos y 0 compras durante 15 minutos
+  # (3 periodos de 5 minutos seguidos). Al hacer una compra, el siguiente periodo da 0 y la alarma vuelve a OK.
+  AbandonedCartAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-carritos-abandonados'
+      AlarmDescription: Hay carritos activos y ninguna compra en 15 minutos
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 1
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: abandonado
+          Label: Carritos abandonados
+          ReturnData: true
+          Expression: 'IF(carritos > 0 AND FILL(compras, 0) == 0, 1, 0)'
+        - Id: carritos
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: URPOnline, MetricName: ActiveCarts}
+            Period: 300
+            Stat: Maximum
+        - Id: compras
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: URPOnline, MetricName: OrdersCreated}
+            Period: 300
+            Stat: Sum
+  # Telemetría en UNA sola pantalla: CloudWatch -> Dashboards -> URPOnline-<pila> (link en Outputs).
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'URPOnline-${AWS::StackName}'
+      DashboardBody: !Sub |
+        {
+          "start": "-PT3H",
+          "periodOverride": "inherit",
+          "widgets": [
+            {"type":"text","x":0,"y":0,"width":24,"height":2,"properties":{"markdown":"# URPOnline en AWS: telemetría de todos los servicios\nTienda (HTTPS): https://${CDN.DomainName}  |  Navega, busca y compra: en 1-2 min suben las gráficas. Termina una EC2 en la consola y mira cómo Auto Scaling la reemplaza."}},
+            {"type":"alarm","x":0,"y":2,"width":24,"height":2,"properties":{"title":"Alarmas","alarms":["${UnhealthyHostsAlarm.Arn}","${Errors5xxAlarm.Arn}","${AbandonedCartAlarm.Arn}"]}},
+            {"type":"metric","x":0,"y":4,"width":8,"height":6,"properties":{"title":"ALB: peticiones y errores 5xx","region":"${AWS::Region}","stat":"Sum","period":60,"view":"timeSeries","metrics":[["AWS/ApplicationELB","RequestCount","LoadBalancer","${ALB.LoadBalancerFullName}",{"label":"Peticiones"}],[".","HTTPCode_Target_5XX_Count",".",".",{"label":"Errores 5xx","color":"#d62728"}]]}},
+            {"type":"metric","x":8,"y":4,"width":8,"height":6,"properties":{"title":"ALB: EC2 sanas detrás del balanceador","region":"${AWS::Region}","stat":"Maximum","period":60,"view":"timeSeries","metrics":[["AWS/ApplicationELB","HealthyHostCount","TargetGroup","${TG.TargetGroupFullName}","LoadBalancer","${ALB.LoadBalancerFullName}",{"label":"Sanas","color":"#2ca02c"}],[".","UnHealthyHostCount",".",".",".",".",{"label":"No sanas","color":"#d62728"}]],"yAxis":{"left":{"min":0}}}},
+            {"type":"metric","x":16,"y":4,"width":8,"height":6,"properties":{"title":"ALB: tiempo de respuesta (s)","region":"${AWS::Region}","stat":"Average","period":60,"view":"timeSeries","metrics":[["AWS/ApplicationELB","TargetResponseTime","LoadBalancer","${ALB.LoadBalancerFullName}",{"label":"Promedio"}],["...",{"stat":"p95","label":"p95"}]]}},
+            {"type":"metric","x":0,"y":10,"width":8,"height":6,"properties":{"title":"EC2 (Auto Scaling): CPU % y memoria %","region":"${AWS::Region}","period":60,"view":"timeSeries","metrics":[["AWS/EC2","CPUUtilization","AutoScalingGroupName","${Scaling}",{"stat":"Average","label":"CPU %"}],["URPOnline/EC2","mem_used_percent","AutoScalingGroupName","${Scaling}",{"stat":"Average","label":"Memoria %"}]],"yAxis":{"left":{"min":0,"max":100}}}},
+            {"type":"metric","x":8,"y":10,"width":8,"height":6,"properties":{"title":"RDS PostgreSQL: conexiones y CPU %","region":"${AWS::Region}","period":60,"view":"timeSeries","metrics":[["AWS/RDS","DatabaseConnections","DBInstanceIdentifier","${Postgres}",{"stat":"Maximum","label":"Conexiones"}],[".","CPUUtilization",".",".",{"stat":"Average","label":"CPU %","yAxis":"right"}]]}},
+            {"type":"metric","x":16,"y":10,"width":8,"height":6,"properties":{"title":"ElastiCache Redis (sesiones): conexiones y memoria %","region":"${AWS::Region}","period":60,"view":"timeSeries","metrics":[[{"expression":"SEARCH('{AWS/ElastiCache,CacheClusterId} MetricName=\"CurrConnections\" ${Redis}', 'Maximum', 60)","id":"conn","label":"Conexiones"}],[{"expression":"SEARCH('{AWS/ElastiCache,CacheClusterId} MetricName=\"DatabaseMemoryUsagePercentage\" ${Redis}', 'Average', 60)","id":"mem","label":"Memoria %","yAxis":"right"}]]}},
+            {"type":"metric","x":0,"y":16,"width":8,"height":6,"properties":{"title":"Tienda (AWS SDK): pedidos y ventas S/","region":"${AWS::Region}","stat":"Sum","period":300,"view":"timeSeries","metrics":[["URPOnline","OrdersCreated",{"label":"Pedidos"}],[".","OrderAmount",{"label":"Ventas S/","yAxis":"right"}]]}},
+            {"type":"metric","x":8,"y":16,"width":8,"height":6,"properties":{"title":"CloudFront (HTTPS): peticiones y % de errores","region":"us-east-1","period":300,"view":"timeSeries","metrics":[["AWS/CloudFront","Requests","Region","Global","DistributionId","${CDN}",{"stat":"Sum","label":"Peticiones"}],[".","5xxErrorRate",".",".",".",".",{"stat":"Average","label":"% 5xx","yAxis":"right"}]]}},
+            {"type":"metric","x":16,"y":16,"width":8,"height":6,"properties":{"title":"EC2: disco usado %","region":"${AWS::Region}","stat":"Average","period":300,"view":"timeSeries","metrics":[["URPOnline/EC2","disk_used_percent","AutoScalingGroupName","${Scaling}",{"label":"Disco %"}]],"yAxis":{"left":{"min":0,"max":100}}}},
+            {"type":"log","x":0,"y":22,"width":24,"height":7,"properties":{"title":"Logs de la tienda (cada logStream = una EC2)","region":"${AWS::Region}","view":"table","query":"SOURCE '${AppLogGroup}' | fields @timestamp, @logStream as EC2, @message | sort @timestamp desc | limit 50"}},
+            {"type":"log","x":0,"y":35,"width":24,"height":6,"properties":{"title":"VPC Flow Logs: tráfico RECHAZADO por security groups / NACL (intentos bloqueados)","region":"${AWS::Region}","view":"table","query":"SOURCE '${FlowLogGroup}' | filter action = 'REJECT' | stats count(*) as intentos by srcAddr, dstAddr, dstPort | sort intentos desc | limit 20"}},
+            {"type":"log","x":0,"y":29,"width":24,"height":6,"properties":{"title":"Nginx: peticiones por EC2 (el ALB reparte)","region":"${AWS::Region}","view":"bar","query":"SOURCE '${NginxLogGroup}' | stats count(*) as peticiones by @logStream as EC2"}},
+            {"type":"metric","x":0,"y":41,"width":24,"height":6,"properties":{"title":"Conversión: carritos activos vs pedidos creados","region":"${AWS::Region}","period":60,"view":"timeSeries","metrics":[["URPOnline","ActiveCarts",{"stat":"Maximum","label":"Carritos activos","color":"#1f77b4"}],["URPOnline","OrdersCreated",{"stat":"Sum","label":"Pedidos creados","color":"#2ca02c"}],["URPOnline","CartItemsAdded",{"stat":"Sum","label":"Productos agregados","yAxis":"right"}]],"yAxis":{"left":{"min":0}}}}
+          ]
+        }
+Outputs:
+  ALBDNS: {Value: !GetAtt ALB.DNSName}
+  DashboardURL: {Description: Telemetría de todos los servicios en una pantalla (CloudWatch), Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards/dashboard/URPOnline-${AWS::StackName}'}
+  ApplicationHTTPS: {Description: URL segura de la tienda (CloudFront), Value: !Sub "https://${CDN.DomainName}"}
+  ApplicationHTTP: {Value: !Sub "http://${ALB.DNSName}"}
+  RDSEndpoint: {Value: !GetAtt Postgres.Endpoint.Address}
+  RedisPrimary: {Value: !GetAtt Redis.PrimaryEndPoint.Address}
+  S3SupplierBucket: {Value: !Ref SupplierBucket}
+  VpcId: {Value: !Ref VPC}
+  DbSecretArn: {Description: Secreto de RDS en Secrets Manager, Value: !Ref DbSecret}
+  MercadoPagoSecretName: {Description: Secreto del token de Mercado Pago (cargar el valor a mano con put-secret-value), Value: !Sub '${AWS::StackName}/mercadopago-access-token'}
+  S3EndpointId: {Description: VPC endpoint de S3 (Gateway), Value: !Ref S3Endpoint}
+  DataNaclId: {Description: NACL de la subred de datos, Value: !Ref DataNacl}
+  TargetGroupArn: {Value: !Ref TG}

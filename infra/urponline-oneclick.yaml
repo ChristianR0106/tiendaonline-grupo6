@@ -237,6 +237,12 @@ Resources:
                 Action:
                   - secretsmanager:GetSecretValue
                 Resource: [!Ref DbSecret, !Ref MercadoPagoSecret]
+              - Effect: Allow
+                Action: ['s3:GetObject', 's3:ListBucket']
+                Resource: [!Sub 'arn:aws:s3:::${ArtifactBucket}', !Sub 'arn:aws:s3:::${ArtifactBucket}/*']
+              - Effect: Allow
+                Action: ['s3:GetObject', 's3:PutObject', 's3:ListBucket']
+                Resource: [!GetAtt SupplierBucket.Arn, !Sub '${SupplierBucket.Arn}/*']
   # VPC Flow Logs: registra el tráfico aceptado y rechazado de toda la VPC en CloudWatch Logs.
   FlowLogGroup:
     Type: AWS::Logs::LogGroup
