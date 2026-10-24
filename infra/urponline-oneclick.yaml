@@ -46,25 +46,6 @@ Parameters:
 Conditions:
   MultiAZ: !Equals [!Ref EnableMultiAZ,'true']
 Resources:
-MercadoPagoSecret:
-    Type: AWS::SecretsManager::Secret
-    Properties:
-      Name: URPOnline/MercadoPagoAccessToken
-      Description: "Token de acceso de prueba para Mercado Pago"
-
-  EC2IAMRolePolicies:
-    Type: AWS::IAM::Policy
-    Properties:
-      PolicyName: ReadMercadoPagoSecretPolicy
-      PolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Action:
-              - secretsmanager:GetSecretValue
-            Resource: !Ref MercadoPagoSecret
-      Roles:
-        - !Ref EC2Role
   VPC:
     Type: AWS::EC2::VPC
     Properties: {CidrBlock: 10.0.0.0/16,EnableDnsHostnames: true,EnableDnsSupport: true,Tags: [{Key: Name,Value: URPOnline-VPC}]}
@@ -214,6 +195,15 @@ MercadoPagoSecret:
       Name: !Sub '${AWS::StackName}/rds-postgres'
       Description: Credenciales de RDS PostgreSQL de URPOnline (las lee la app con el AWS SDK)
       SecretString: !Sub '{"username":"urponline","password":"${DBPassword}"}'
+  # Bloque 3c: secreto del Access Token de PRUEBA de Mercado Pago.
+  # Se crea VACIO (sin SecretString): el valor se carga a mano con
+  #   aws secretsmanager put-secret-value --secret-id <nombre> --secret-string "<token>"
+  # y nunca aparece en GitHub, en este YAML ni en la EC2. La app lo lee con el AWS SDK.
+  MercadoPagoSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/mercadopago-access-token'
+      Description: Access Token de PRUEBA de Mercado Pago (valor cargado a mano, no esta en el YAML)
   RedisSubnet:
     Type: AWS::ElastiCache::SubnetGroup
     Properties: {Description: URPOnline data subnets,SubnetIds: [!Ref DataA,!Ref DataB]}
@@ -246,57 +236,7 @@ MercadoPagoSecret:
               - Effect: Allow
                 Action:
                   - secretsmanager:GetSecretValue
-                Resource: !Ref DbSecret
-  AbandonedCartAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: URPOnline-AbandonedCartAlarm
-      AlarmDescription: "Dispara cuando hay carritos activos pero ninguna compra en 15 minutos"
-      EvaluationPeriods: 1
-      Threshold: 1
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      Metrics:
-        - Id: e1
-          Expression: "IF(m1 > 0 AND m2 == 0, 1, 0)"
-          Label: "Estado Carritos Abandonados"
-        - Id: m1
-          MetricStat:
-            Metric:
-              Namespace: URPOnline
-              MetricName: ActiveCarts
-            Period: 900
-            Stat: Maximum
-        - Id: m2
-          MetricStat:
-            Metric:
-              Namespace: URPOnline
-              MetricName: OrdersCreated
-            Period: 900
-            Stat: Sum
-
-  # Widget de Conversión en el Dashboard
-  URPOnlineDashboard:
-    Type: AWS::CloudWatch::Dashboard
-    Properties:
-      DashboardName: URPOnline-Dashboard
-      DashboardBody: !Sub |
-        {
-          "widgets": [
-            {
-              "type": "metric",
-              "properties": {
-                "metrics": [
-                  [ "URPOnline", "ActiveCarts", { "stat": "Maximum", "period": 60, "color": "#1f77b4" } ],
-                  [ "URPOnline", "OrdersCreated", { "stat": "Sum", "period": 60, "color": "#2ca02c" } ]
-                ],
-                "view": "timeSeries",
-                "stacked": false,
-                "title": "Conversión: Carritos Activos vs Ventas Realizadas",
-                "period": 300
-              }
-            }
-          ]
-        }
+                Resource: [!Ref DbSecret, !Ref MercadoPagoSecret]
   # VPC Flow Logs: registra el tráfico aceptado y rechazado de toda la VPC en CloudWatch Logs.
   FlowLogGroup:
     Type: AWS::Logs::LogGroup
@@ -398,9 +338,11 @@ MercadoPagoSecret:
             cat >/etc/urponline.env <<'ENV'
             ASPNETCORE_ENVIRONMENT=Production
             ASPNETCORE_URLS=http://127.0.0.1:8080
-            ConnectionStrings__Postgres=Host=127.0.0.1;Port=6432;Database=urponline;Username=urponline;SSL Mode=Require;
+            ConnectionStrings__Postgres=Host=127.0.0.1;Port=6432;Database=urponline;Username=urponline;SSL Mode=Disable;
             # Sin contraseña: la app la pide a Secrets Manager con el AWS SDK.
             Database__SecretArn=${DbSecret}
+            # Bloque 3c: ARN del secreto con el token de prueba de Mercado Pago (la app lo lee con el AWS SDK).
+            MercadoPago__SecretArn=${MercadoPagoSecret}
             ConnectionStrings__Redis=${Redis.PrimaryEndPoint.Address}:6379,ssl=true,abortConnect=false
             # Aplica las migraciones EF Core (tablas + pgvector + índice HNSW) al arrancar; un bloqueo en PostgreSQL evita que 2 EC2 migren a la vez.
             InitializeDatabase=true
@@ -430,36 +372,60 @@ MercadoPagoSecret:
             WantedBy=multi-user.target
             SYSTEMD
 
-            # --- CONFIGURACIÓN DE PGBOUNCER EN USERDATA ---
+            # --- PGBOUNCER: contenedor con podman, solo accesible en 127.0.0.1:6432 ---
+            set +x   # que la contraseña no quede en el log de cloud-init
             SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id ${DbSecret} --query SecretString --output text --region ${AWS::Region})
-            DB_USER=$(echo $SECRET_JSON | jq -r .username)
-            DB_PASS=$(echo $SECRET_JSON | jq -r .password)
+            DB_USER=$(echo "$SECRET_JSON" | jq -r .username)
+            DB_PASS=$(echo "$SECRET_JSON" | jq -r .password)
+            mkdir -p /etc/pgbouncer
+            cat >/etc/pgbouncer/pgbouncer.env <<EOF
+            DB_HOST=${Postgres.Endpoint.Address}
+            DB_PORT=5432
+            DB_NAME=urponline
+            DB_USER=$DB_USER
+            DB_PASSWORD=$DB_PASS
+            POOL_MODE=transaction
+            MAX_CLIENT_CONN=400
+            DEFAULT_POOL_SIZE=30
+            RESERVE_POOL_SIZE=5
+            AUTH_TYPE=plain
+            SERVER_TLS_SSLMODE=require
+            EOF
+            chmod 600 /etc/pgbouncer/pgbouncer.env
+            unset SECRET_JSON DB_PASS
+            set -x
+            podman pull docker.io/edoburu/pgbouncer:latest
+            cat >/etc/systemd/system/pgbouncer.service <<'PGBSVC'
+            [Unit]
+            Description=PgBouncer (podman)
+            After=network-online.target
+            Wants=network-online.target
+            [Service]
+            ExecStartPre=-/usr/bin/podman rm -f pgbouncer
+            ExecStart=/usr/bin/podman run --rm --name pgbouncer --env-file /etc/pgbouncer/pgbouncer.env -p 127.0.0.1:6432:5432 docker.io/edoburu/pgbouncer:latest
+            ExecStop=/usr/bin/podman stop pgbouncer
+            Restart=always
+            RestartSec=5
+            [Install]
+            WantedBy=multi-user.target
+            PGBSVC
+            systemctl daemon-reload
+            systemctl enable --now pgbouncer
 
-            cat <<EOF > /etc/pgbouncer/pgbouncer.ini
-[databases]
-urponline = host=${Postgres.Endpoint.Address} port=5432 dbname=urponline
-
-[pgbouncer]
-listen_addr = 127.0.0.1
-listen_port = 6432
-pool_mode = transaction
-max_client_conn = 400
-default_pool_size = 30
-reserve_pool_size = 5
-auth_type = plain
-auth_file = /etc/pgbouncer/userlist.txt
-logfile = /var/log/pgbouncer/pgbouncer.log
-pidfile = /var/run/pgbouncer/pgbouncer.pid
-EOF
-
-            cat <<EOF > /etc/pgbouncer/userlist.txt
-"$DB_USER" "$DB_PASS"
-EOF
-
-            chmod 600 /etc/pgbouncer/userlist.txt
-            chown -R pgbouncer:pgbouncer /etc/pgbouncer
-
-            systemctl restart pgbouncer
+            # --- NGINX: proxy inverso hacia la tienda (127.0.0.1:8080) ---
+            cat >/etc/nginx/conf.d/urponline.conf <<'NGINX'
+            server {
+                listen 80 default_server;
+                server_name _;
+                location / {
+                    proxy_pass http://127.0.0.1:8080;
+                    proxy_http_version 1.1;
+                    proxy_set_header Host $host;
+                    proxy_set_header X-Real-IP $remote_addr;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+                }
+            }
             NGINX
             rm -f /etc/nginx/conf.d/default.conf
             systemctl daemon-reload
@@ -527,6 +493,35 @@ EOF
       Threshold: 5
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
+  # Bloque 3b: alarma de carritos abandonados = hay carritos activos y 0 compras durante 15 minutos
+  # (3 periodos de 5 minutos seguidos). Al hacer una compra, el siguiente periodo da 0 y la alarma vuelve a OK.
+  AbandonedCartAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-carritos-abandonados'
+      AlarmDescription: Hay carritos activos y ninguna compra en 15 minutos
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 1
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: abandonado
+          Label: Carritos abandonados
+          ReturnData: true
+          Expression: 'IF(carritos > 0 AND FILL(compras, 0) == 0, 1, 0)'
+        - Id: carritos
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: URPOnline, MetricName: ActiveCarts}
+            Period: 300
+            Stat: Maximum
+        - Id: compras
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: URPOnline, MetricName: OrdersCreated}
+            Period: 300
+            Stat: Sum
   # Telemetría en UNA sola pantalla: CloudWatch -> Dashboards -> URPOnline-<pila> (link en Outputs).
   Dashboard:
     Type: AWS::CloudWatch::Dashboard
@@ -538,7 +533,7 @@ EOF
           "periodOverride": "inherit",
           "widgets": [
             {"type":"text","x":0,"y":0,"width":24,"height":2,"properties":{"markdown":"# URPOnline en AWS: telemetría de todos los servicios\nTienda (HTTPS): https://${CDN.DomainName}  |  Navega, busca y compra: en 1-2 min suben las gráficas. Termina una EC2 en la consola y mira cómo Auto Scaling la reemplaza."}},
-            {"type":"alarm","x":0,"y":2,"width":24,"height":2,"properties":{"title":"Alarmas","alarms":["${UnhealthyHostsAlarm.Arn}","${Errors5xxAlarm.Arn}"]}},
+            {"type":"alarm","x":0,"y":2,"width":24,"height":2,"properties":{"title":"Alarmas","alarms":["${UnhealthyHostsAlarm.Arn}","${Errors5xxAlarm.Arn}","${AbandonedCartAlarm.Arn}"]}},
             {"type":"metric","x":0,"y":4,"width":8,"height":6,"properties":{"title":"ALB: peticiones y errores 5xx","region":"${AWS::Region}","stat":"Sum","period":60,"view":"timeSeries","metrics":[["AWS/ApplicationELB","RequestCount","LoadBalancer","${ALB.LoadBalancerFullName}",{"label":"Peticiones"}],[".","HTTPCode_Target_5XX_Count",".",".",{"label":"Errores 5xx","color":"#d62728"}]]}},
             {"type":"metric","x":8,"y":4,"width":8,"height":6,"properties":{"title":"ALB: EC2 sanas detrás del balanceador","region":"${AWS::Region}","stat":"Maximum","period":60,"view":"timeSeries","metrics":[["AWS/ApplicationELB","HealthyHostCount","TargetGroup","${TG.TargetGroupFullName}","LoadBalancer","${ALB.LoadBalancerFullName}",{"label":"Sanas","color":"#2ca02c"}],[".","UnHealthyHostCount",".",".",".",".",{"label":"No sanas","color":"#d62728"}]],"yAxis":{"left":{"min":0}}}},
             {"type":"metric","x":16,"y":4,"width":8,"height":6,"properties":{"title":"ALB: tiempo de respuesta (s)","region":"${AWS::Region}","stat":"Average","period":60,"view":"timeSeries","metrics":[["AWS/ApplicationELB","TargetResponseTime","LoadBalancer","${ALB.LoadBalancerFullName}",{"label":"Promedio"}],["...",{"stat":"p95","label":"p95"}]]}},
@@ -550,7 +545,8 @@ EOF
             {"type":"metric","x":16,"y":16,"width":8,"height":6,"properties":{"title":"EC2: disco usado %","region":"${AWS::Region}","stat":"Average","period":300,"view":"timeSeries","metrics":[["URPOnline/EC2","disk_used_percent","AutoScalingGroupName","${Scaling}",{"label":"Disco %"}]],"yAxis":{"left":{"min":0,"max":100}}}},
             {"type":"log","x":0,"y":22,"width":24,"height":7,"properties":{"title":"Logs de la tienda (cada logStream = una EC2)","region":"${AWS::Region}","view":"table","query":"SOURCE '${AppLogGroup}' | fields @timestamp, @logStream as EC2, @message | sort @timestamp desc | limit 50"}},
             {"type":"log","x":0,"y":35,"width":24,"height":6,"properties":{"title":"VPC Flow Logs: tráfico RECHAZADO por security groups / NACL (intentos bloqueados)","region":"${AWS::Region}","view":"table","query":"SOURCE '${FlowLogGroup}' | filter action = 'REJECT' | stats count(*) as intentos by srcAddr, dstAddr, dstPort | sort intentos desc | limit 20"}},
-            {"type":"log","x":0,"y":29,"width":24,"height":6,"properties":{"title":"Nginx: peticiones por EC2 (el ALB reparte)","region":"${AWS::Region}","view":"bar","query":"SOURCE '${NginxLogGroup}' | stats count(*) as peticiones by @logStream as EC2"}}
+            {"type":"log","x":0,"y":29,"width":24,"height":6,"properties":{"title":"Nginx: peticiones por EC2 (el ALB reparte)","region":"${AWS::Region}","view":"bar","query":"SOURCE '${NginxLogGroup}' | stats count(*) as peticiones by @logStream as EC2"}},
+            {"type":"metric","x":0,"y":41,"width":24,"height":6,"properties":{"title":"Conversión: carritos activos vs pedidos creados","region":"${AWS::Region}","period":60,"view":"timeSeries","metrics":[["URPOnline","ActiveCarts",{"stat":"Maximum","label":"Carritos activos","color":"#1f77b4"}],["URPOnline","OrdersCreated",{"stat":"Sum","label":"Pedidos creados","color":"#2ca02c"}],["URPOnline","CartItemsAdded",{"stat":"Sum","label":"Productos agregados","yAxis":"right"}]],"yAxis":{"left":{"min":0}}}}
           ]
         }
 Outputs:
@@ -563,6 +559,7 @@ Outputs:
   S3SupplierBucket: {Value: !Ref SupplierBucket}
   VpcId: {Value: !Ref VPC}
   DbSecretArn: {Description: Secreto de RDS en Secrets Manager, Value: !Ref DbSecret}
+  MercadoPagoSecretName: {Description: Secreto del token de Mercado Pago (cargar el valor a mano con put-secret-value), Value: !Sub '${AWS::StackName}/mercadopago-access-token'}
   S3EndpointId: {Description: VPC endpoint de S3 (Gateway), Value: !Ref S3Endpoint}
   DataNaclId: {Description: NACL de la subred de datos, Value: !Ref DataNacl}
   TargetGroupArn: {Value: !Ref TG}
