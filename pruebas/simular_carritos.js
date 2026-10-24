@@ -1,5 +1,5 @@
 import http from 'k6/http';
-import { sleep } from 'k6';
+import { sleep, check } from 'k6';
 
 export const options = {
   vus: 30,
@@ -7,15 +7,20 @@ export const options = {
 };
 
 export default function () {
-  // Reemplaza con tu URL real
   const baseUrl = 'http://ec2-100-52-153-159.compute-1.amazonaws.com';
-  // 1. Entrar a la tienda
-  http.get(`${baseUrl}/Cart`);
+
+  // 1. Obtener la página principal (para iniciar sesión / cookie)
+  const homeRes = http.get(`${baseUrl}/`);
+  check(homeRes, { 'home status 200': (r) => r.status === 200 });
 
   // 2. Agregar al carrito
-  http.post(`${baseUrl}/Cart/AddToCart`, {
+  const cartRes = http.post(`${baseUrl}/Cart/AddToCart`, {
     productId: '00000000-0000-0000-0000-000000000001',
     quantity: '1',
+  });
+
+  check(cartRes, {
+    'cart status 200 or 302': (r) => r.status === 200 || r.status === 302,
   });
 
   sleep(10);
